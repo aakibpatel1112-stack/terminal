@@ -1,0 +1,143 @@
+name: LLM localization test
+
+on:
+  push:
+    branches:
+      - dev/lhecker/llm-localization
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: llm-localization-test
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  checkpoint:
+    name: Create fake historical checkpoint
+    if: github.ref == 'refs/heads/dev/lhecker/llm-localization'
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    outputs:
+      baseline: ${{ steps.plan.outputs.baseline }}
+      languages: ${{ steps.plan.outputs.languages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test harness
+        run: |
+          .\tools\localization\Test-Translate-Resw.ps1
+          .\tools\localization\Test-IncrementalLocalization.ps1
+      - name: Create local test tag six weeks before source commit
+        id: plan
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $date = [DateTimeOffset]::Parse((git show -s --format=%cI HEAD))
+          $cutoff = $date.AddDays(-42).ToString('o')
+          $baseline = git rev-list -1 "--before=$cutoff" HEAD
+          if (-not $baseline) { throw 'No source commit at the historical cutoff.' }
+          $tag = "localization-test-baseline-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          git tag $tag $baseline
+          $baseline = git rev-parse "$tag^{commit}"
+          .\tools\localization\Invoke-Localization.ps1 -Operation Plan -Baseline $baseline -WorkDirectory "$env:RUNNER_TEMP\plan"
+          $plan = Get-Content -Raw "$env:RUNNER_TEMP\plan\plan.json" | ConvertFrom-Json
+          $languages = ConvertTo-Json -Compress -InputObject @($plan.languages)
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+          "languages=$languages" >> $env:GITHUB_OUTPUT
+          "## Localization test`nLocal tag: $tag`nBaseline: $baseline`nCutoff: $cutoff`nLanguages: $languages" >> $env:GITHUB_STEP_SUMMARY
+
+  translate:
+    name: Translate (${{ matrix.language }})
+    needs: checkpoint
+    if: needs.checkpoint.outputs.languages != '[]'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      copilot-requests: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        language: ${{ fromJSON(needs.checkpoint.outputs.languages) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Install Copilot CLI
+        run: npm install --global @github/copilot@1.0.105
+      - name: Download Microsoft terminology
+        run: |
+          Invoke-WebRequest -Uri 'https://download.microsoft.com/download/b/2/d/b2db7a7c-8d33-47f3-b2c1-ee5e6445cf45/MicrosoftTermCollection.zip' -OutFile "$env:RUNNER_TEMP\terminology.zip"
+      - name: Prepare incremental batches
+        env:
+          BASELINE: ${{ needs.checkpoint.outputs.baseline }}
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          .\tools\localization\Invoke-Localization.ps1 -Operation Prepare -Baseline $env:BASELINE -Language $env:LANGUAGE -WorkDirectory "$env:RUNNER_TEMP\translation" -TerminologyArchive "$env:RUNNER_TEMP\terminology.zip"
+      - name: Translate with read-only repository credentials
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASELINE: ${{ needs.checkpoint.outputs.baseline }}
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          .\tools\localization\Invoke-Localization.ps1 -Operation Translate -Baseline $env:BASELINE -Language $env:LANGUAGE -WorkDirectory "$env:RUNNER_TEMP\translation"
+      - name: Export only response JSON
+        env:
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          $root = "$env:RUNNER_TEMP\translation"
+          foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Filter '*.output.json') {
+            $relative = [IO.Path]::GetRelativePath($root, $file.FullName)
+            $destination = Join-Path "$env:RUNNER_TEMP\responses\$env:LANGUAGE" $relative
+            [void][IO.Directory]::CreateDirectory((Split-Path $destination))
+            Copy-Item -LiteralPath $file.FullName -Destination $destination
+          }
+          # Keep deletion-only language artifacts nonempty.
+          [void][IO.Directory]::CreateDirectory("$env:RUNNER_TEMP\responses\$env:LANGUAGE")
+          Set-Content "$env:RUNNER_TEMP\responses\$env:LANGUAGE\complete.txt" 'Responses only; revalidate before publishing.'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: localization-${{ matrix.language }}
+          path: ${{ runner.temp }}\responses
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Revalidate and push test branch
+    needs: [checkpoint, translate]
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: localization-*
+          merge-multiple: true
+          path: ${{ runner.temp }}\responses
+      - name: Validate artifacts with trusted scripts and push without force
+        env:
+          BASELINE: ${{ needs.checkpoint.outputs.baseline }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tip = git ls-remote --heads origin refs/heads/dev/lhecker/llm-localization
+          if (-not $tip -or ($tip -split '\s+')[0] -ne $env:GITHUB_SHA) {
+            throw 'A newer source push superseded this run; refusing to publish stale translations.'
+          }
+          .\tools\localization\Publish-Localization.ps1 -Baseline $env:BASELINE -ResponsesDirectory "$env:RUNNER_TEMP\responses" -WorkDirectory "$env:RUNNER_TEMP\publication"
